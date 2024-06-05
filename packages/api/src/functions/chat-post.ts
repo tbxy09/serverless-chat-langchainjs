@@ -2,7 +2,7 @@ import { Readable } from 'node:stream';
 import { HttpRequest, InvocationContext, HttpResponseInit, app } from '@azure/functions';
 import { AIChatCompletionRequest, AIChatCompletionDelta } from '@microsoft/ai-chat-protocol';
 import { Document } from '@langchain/core/documents';
-import { AzureOpenAIEmbeddings, AzureChatOpenAI } from '@langchain/openai';
+// import { AzureOpenAIEmbeddings, AzureChatOpenAI } from '@langchain/openai';
 import { Embeddings } from '@langchain/core/embeddings';
 import { BaseChatModel } from '@langchain/core/language_models/chat_models';
 import { VectorStore } from '@langchain/core/vectorstores';
@@ -17,6 +17,7 @@ import 'dotenv/config';
 import { badRequest, data, serviceUnavailable } from '../http-response';
 import { ollamaChatModel, ollamaEmbeddingsModel, faissStoreFolder } from '../constants';
 import { getAzureOpenAiTokenProvider, getCredentials } from '../security';
+import { start } from 'node:repl';
 
 const systemPrompt = `Assistant helps the Consto Real Estate company customers with questions and support requests. Be brief in your answers. Answer only plain text, DO NOT use Markdown.
 Answer ONLY with information from the sources below. If there isn't enough information in the sources, say you don't know. Do not generate answers that don't use the sources. If asking a clarifying question to the user would help, ask the question.
@@ -38,10 +39,14 @@ SOURCES:
 
 export async function postChat(request: HttpRequest, context: InvocationContext): Promise<HttpResponseInit> {
   const azureOpenAiEndpoint = process.env.AZURE_OPENAI_API_ENDPOINT;
+  const startTime = Date.now();
 
   try {
     const requestBody = (await request.json()) as AIChatCompletionRequest;
     const { messages } = requestBody;
+    context.log("Received messages: ", messages)
+    const requestTime = Date.now() - startTime;
+    context.log(`Azure OpenAI endpoint set, using Azure models and Azure DB. Request time: ${requestTime}`);
 
     if (!messages || messages.length === 0 || !messages.at(-1)?.content) {
       return badRequest('Invalid or missing messages in the request body');
@@ -55,7 +60,8 @@ export async function postChat(request: HttpRequest, context: InvocationContext)
       const credentials = getCredentials();
       const azureADTokenProvider = getAzureOpenAiTokenProvider();
 
-      // Initialize models and vector database
+
+      // Initialize models Wand vector database
       embeddings = new AzureOpenAIEmbeddings({ azureADTokenProvider });
       model = new AzureChatOpenAI({
         // Controls randomness. 0 = deterministic, 1 = maximum randomness
@@ -73,7 +79,7 @@ export async function postChat(request: HttpRequest, context: InvocationContext)
       });
       store = await FaissStore.load(faissStoreFolder, embeddings);
     }
-
+    const startstuffDocsChainTime = Date.now();
     // Create the chain that combines the prompt with the documents
     const combineDocsChain = await createStuffDocumentsChain({
       llm: model,
@@ -83,19 +89,29 @@ export async function postChat(request: HttpRequest, context: InvocationContext)
       ]),
       documentPrompt: PromptTemplate.fromTemplate('[{source}]: {page_content}\n'),
     });
-
+    const stuffDocsChainTime = Date.now() - startstuffDocsChainTime
+    console.log(`Stuff Documents Chain creation time: ${stuffDocsChainTime}ms`);
+  
+    const startRetrievalChainTime = Date.now();
     // Create the chain to retrieve the documents from the database
     const chain = await createRetrievalChain({
       retriever: store.asRetriever(3),
       combineDocsChain,
     });
+    const retrievalChainTime = Date.now() - startRetrievalChainTime
+    console.log(`Retrieval Chain creation time: ${retrievalChainTime}ms`);
 
+    const messagesLength = messages.length;
+    context.log(`Processing ${messagesLength} messages`);
+
+    const startChainTime = Date.now();
     const lastUserMessage = messages.at(-1)!.content;
     const responseStream = await chain.stream({
       input: lastUserMessage,
     });
     const jsonStream = Readable.from(createJsonStream(responseStream));
-
+    const chainTime = Date.now() - startChainTime;
+    context.log(`Chain processing time: ${chainTime}ms`);
     return data(jsonStream, {
       'Content-Type': 'application/x-ndjson',
       'Transfer-Encoding': 'chunked',
